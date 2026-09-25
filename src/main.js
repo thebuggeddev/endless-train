@@ -14,7 +14,10 @@ const rr = (rng,a,b) => a + (b-a)*rng();
 // ---------- renderer / scene ----------
 const canvas = $('#scene');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, powerPreference:'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+// resolution adapts to hold 60fps: drops when frames run late, climbs back when there is headroom
+const DPR_MAX = Math.min(window.devicePixelRatio || 1, 1.5), DPR_MIN = Math.min(DPR_MAX, 0.75);
+let dpr = DPR_MAX;
+renderer.setPixelRatio(dpr);
 renderer.setSize(innerWidth, innerHeight, false);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -1110,7 +1113,8 @@ function buildJunction(ctx, f, O, rng, group){
   house(ctx, Mend, 15, 8, styleFor(rng), rng);
 }
 
-function buildChunk(ci){
+// a generator so a chunk can be built a few milliseconds at a time across frames
+function* buildChunk(ci){
   const s0 = ci*CH, s1 = s0 + CH, rng = mulberry32(ci*9973 + 17);
   const O = pt(s0, 0, 0, new THREE.Vector3());
   const ctx = { P:new Builder(), A:[new Builder(0.55), new Builder(0.55)], GL:new Builder(), GD:new Builder(), LP:new Builder(), CA:new Builder(), RL:new Builder(), LC:new Builder(), W:new Builder(), leaves:[], leafData:[], lights:[], wall:'#fff', gapAt:null };
@@ -1118,6 +1122,7 @@ function buildChunk(ci){
   const extras = [], chunk = { group, extras, lower:null };
 
   streetAlong(ctx, frame, s0, s1, O);
+  yield;
   const feats = featuresIn(s0 - 1, s1 + 1);
   for (let s = Math.ceil(s0/18)*18; s < s1; s += 18){
     let openL = false, openR = false, bridge = false, skip = false;
@@ -1130,6 +1135,7 @@ function buildChunk(ci){
     if (!skip) spanWire(ctx, O, s, openL, openR, frame, bridge);
   }
   cobbles(group, frame, s0, s1, O, rng);
+  yield;
 
   // houses in 20 m cells, deterministic per cell and side
   for (const side of [1,-1]){
@@ -1140,9 +1146,9 @@ function buildChunk(ci){
       for (let k=0;k<splits-1;k++){ const avg = rem/(splits-k); const w = Math.max(4.2, Math.min(rem-4.2*(splits-k-1), avg*rr(cr,0.8,1.2))); ws.push(w); rem -= w; }
       ws.push(rem);
       let s = cell*CELL;
-      ws.forEach((w, k) => {
-        const sc = s + w/2, roll = cr();
-        if (skipHouse(side, s, s + w, false)){ s += w; return; }
+      for (let k = 0; k < ws.length; k++){
+        const w = ws[k], sc = s + w/2, roll = cr();
+        if (skipHouse(side, s, s + w, false)){ s += w; continue; }
         const nearArch = feats.some(f => f.type === 'arch' && s < f.s1 + 1.5 && s + w > f.s0 - 1.5);
         const festive = feats.some(f => f.type === 'festival' && s < f.s1 && s + w > f.s0);
         // sit the house on the highest point of the pavement along its front, never below it
@@ -1172,7 +1178,8 @@ function buildChunk(ci){
           house(ctx, M, w, 8, st, cr);
         }
         s += w;
-      });
+        yield;
+      }
       let sb = cell*CELL + rr(cr,-1.5,1.5);
       while (sb < (cell+1)*CELL){
         const w = rr(cr, 5.5, 8.5), scb = sb + w/2;
@@ -1181,6 +1188,7 @@ function buildChunk(ci){
         if (!skipHouse(side, sb, sb + w, true)) backHouse(ctx, houseMatrix(scb, side, O, 8.6, lift), w, 8, fl, cr);
         sb += w;
       }
+      yield;
     }
   }
   ctx.gapAt = null;
@@ -1214,6 +1222,7 @@ function buildChunk(ci){
     else if (f.type === 'miradouro') buildMiradouro(ctx, f, O, rng);
     else if (f.type === 'bridge') buildBridge(ctx, f, O, rng, group, chunk);
     else if (f.type === 'junction') buildJunction(ctx, f, O, rng, group);
+    yield;
   }
 
   const add = m => { if (m) group.add(m); };
@@ -1238,7 +1247,6 @@ function buildChunk(ci){
     const pg = new THREE.BufferGeometry(); pg.setAttribute('position', new THREE.Float32BufferAttribute(ctx.lights, 3));
     const pts = new THREE.Points(pg, matCityLights); pts.frustumCulled = false; group.add(pts);
   }
-  scene.add(group);
   return chunk;
 }
 function disposeChunk(c){
@@ -1248,13 +1256,31 @@ function disposeChunk(c){
   for (const e of c.extras) e.dispose();
 }
 const chunks = new Map();
+// chunks ahead are built within a per-frame time budget, then their shaders compile off the main thread before they appear
+const BUILD_MS = 4;
+let job = null;
+function finishChunk(i, c, sync){
+  chunks.set(i, c);
+  if (sync){ scene.add(c.group); return; }
+  c.pending = true;
+  renderer.compileAsync(c.group, camera, scene).catch(() => {}).then(() => { if (c.pending){ c.pending = false; scene.add(c.group); } });
+}
 function updateChunks(s, all){
-  const i0 = Math.floor((s-45)/CH), i1 = Math.floor((s+150)/CH);
-  let built = 0;
+  const i0 = Math.floor((s-45)/CH), i1 = Math.floor((s+170)/CH);
+  if (job && (job.i < i0-1 || job.i > i1+1)) job = null;
   for (let i=Math.max(0,i0); i<=i1; i++){
-    if (!chunks.has(i) && (all || built < 1)){ chunks.set(i, buildChunk(i)); built++; }
+    if (chunks.has(i) || (job && job.i === i)) continue;
+    // the chunk under the tram can't wait: build it now
+    if (all || i <= Math.floor(s/CH) + 1){ const g = buildChunk(i); let r; do r = g.next(); while (!r.done); finishChunk(i, r.value, true); }
+    else if (!job) job = { i, g:buildChunk(i) };
   }
-  for (const [i,c] of chunks) if (i < i0-1 || i > i1+1){ disposeChunk(c); chunks.delete(i); }
+  if (job && !all){
+    const t0 = performance.now();
+    let r;
+    do r = job.g.next(); while (!r.done && performance.now() - t0 < BUILD_MS);
+    if (r.done){ finishChunk(job.i, r.value, false); job = null; }
+  }
+  for (const [i,c] of chunks) if (i < i0-1 || i > i1+1){ c.pending = false; disposeChunk(c); chunks.delete(i); }
 }
 
 
@@ -1619,7 +1645,8 @@ function applyLighting(){
 
 
 // ---------- state ----------
-const AUTO_V = 25/3.6, MAXF = 45/3.6, MAXR = -12/3.6, BRAKE = 2.6, LOCK_AHEAD = 260;
+const AUTO_V = 50/3.6, AUTO_ACC = 1.4, AUTO_DEC = 1.6, MAXF = 70/3.6, MAXR = -12/3.6, BRAKE = 3.2, LOCK_AHEAD = 260;
+const DIAL_MAX = 80;
 let v = 0, sTram = 34, odo = 0, dwell = 0, nStop = 0, served = 0, lastJoint = 0, prevV = 0, brakeHold = 0;
 let driveState = 'Parked', autopilot = false, braking = false, time = 0;
 while (stopS(nStop) < sTram + 1) nStop++;
@@ -1671,10 +1698,10 @@ let needle = null;
   const svg = $$('dialSvg'), NS = 'http://www.w3.org/2000/svg';
   const mk = (n, a) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); svg.appendChild(e); return e; };
   mk('circle', { cx:100, cy:100, r:97, fill:'#8C6A2A' }); mk('circle', { cx:100, cy:100, r:93, fill:'#C9A24A' }); mk('circle', { cx:100, cy:100, r:88, fill:'#F4EEDC' });
-  const arc = (v0, v1, r) => { const a0 = (-210 + v0/50*240)*PI/180, a1 = (-210 + v1/50*240)*PI/180; return `M${100+Math.cos(a0)*r} ${100+Math.sin(a0)*r} A${r} ${r} 0 0 1 ${100+Math.cos(a1)*r} ${100+Math.sin(a1)*r}`; };
-  mk('path', { d:arc(40, 50, 78), stroke:'#B3261E', 'stroke-width':10, fill:'none' });
-  for (let s = 0; s <= 50; s += 5){
-    const a = (-210 + s/50*240)*PI/180, big = s % 10 === 0, r0 = big ? 69 : 75;
+  const arc = (v0, v1, r) => { const a0 = (-210 + v0/DIAL_MAX*240)*PI/180, a1 = (-210 + v1/DIAL_MAX*240)*PI/180; return `M${100+Math.cos(a0)*r} ${100+Math.sin(a0)*r} A${r} ${r} 0 0 1 ${100+Math.cos(a1)*r} ${100+Math.sin(a1)*r}`; };
+  mk('path', { d:arc(MAXF*3.6, DIAL_MAX, 78), stroke:'#B3261E', 'stroke-width':10, fill:'none' });
+  for (let s = 0; s <= DIAL_MAX; s += 5){
+    const a = (-210 + s/DIAL_MAX*240)*PI/180, big = s % 10 === 0, r0 = big ? 69 : 75;
     mk('line', { x1:100+Math.cos(a)*r0, y1:100+Math.sin(a)*r0, x2:100+Math.cos(a)*83, y2:100+Math.sin(a)*83, stroke:'#1B2B55', 'stroke-width':big ? 6 : 3.5, 'stroke-linecap':'round' });
   }
   needle = mk('line', { x1:100, y1:112, x2:100, y2:26, stroke:'#B3261E', 'stroke-width':8, 'stroke-linecap':'round' });
@@ -1837,22 +1864,22 @@ function drive(dt){
   }
   if (autopilot){
     driveState = 'Autopilot';
-    if (d <= (v*v)/(2*1.15) + 0.3 && d > -0.5){
-      v = Math.min(Math.max(v, 0.6), Math.sqrt(Math.max(0, 2*1.15*Math.max(0, d - 0.05)))); braking = v > 1;
+    if (d <= (v*v)/(2*AUTO_DEC) + 0.3 && d > -0.5){
+      v = Math.min(Math.max(v, 0.6), Math.sqrt(Math.max(0, 2*AUTO_DEC*Math.max(0, d - 0.05)))); braking = v > 1;
       if (d < 0.08 || v < 0.06){ v = 0; sTram = ss; dwell = 3.4; served++; }
     } else {
       if (d < -0.5) nStop++;
-      const a = AUTO_V > v ? 0.95 : 1.5;
+      const a = AUTO_V > v ? AUTO_ACC : 1.5;
       v += Math.sign(AUTO_V - v) * Math.min(Math.abs(AUTO_V - v), a*dt);
     }
     return;
   }
-  const grav = -9.81 * dhy(sTram) * 0.32, drag = -0.004 * v * Math.abs(v);
+  const grav = -9.81 * dhy(sTram) * 0.32, drag = -0.0025 * v * Math.abs(v);
   brakeHold = input.brake && Math.abs(v) < 0.1 ? brakeHold + dt : (input.brake ? brakeHold : 0);
   if (input.go && !input.brake){
     let a;
     if (v < -0.05){ a = BRAKE; driveState = 'Braking'; braking = true; }
-    else { a = 1.35*Math.max(0, 1 - v/MAXF) + 0.25 + grav + drag; driveState = 'Power'; }
+    else { a = 2.2*Math.max(0, 1 - v/MAXF) + 0.6 + grav + drag; driveState = 'Power'; }
     const nv = v + a*dt; v = (v < 0 && nv > 0) ? 0 : nv;
   } else if (input.brake){
     if (v > 0.05){ driveState = 'Braking'; braking = true; const nv = v + (-BRAKE + grav*0.3)*dt; v = nv < 0 ? 0 : nv; }
@@ -1878,8 +1905,23 @@ const LEVER = { Power:10, Coasting:40, Parked:40, Holding:68, Braking:68, Revers
 const _tmp = new THREE.Vector3(), _fb = new THREE.Vector3(), _rb = new THREE.Vector3();
 let lastT = performance.now();
 updateChunks(sTram, true);
+// capped at 60fps: on faster displays the extra vsyncs are skipped
+const FRAME_MS = 1000/60;
+let nextFrame = 0, frameAvg = FRAME_MS, slowT = 0, fastT = 0;
+function adaptResolution(ms){
+  if (ms > 100) return; // tab was hidden or paused
+  frameAvg += (ms - frameAvg)*0.1;
+  if (frameAvg > FRAME_MS + 2.5){ slowT += ms; fastT = 0; } else if (frameAvg < FRAME_MS + 0.8){ fastT += ms; slowT = 0; }
+  if (slowT > 500 && dpr > DPR_MIN){ dpr = Math.max(DPR_MIN, dpr - 0.125); renderer.setPixelRatio(dpr); slowT = 0; frameAvg = FRAME_MS; }
+  else if (fastT > 4000 && dpr < DPR_MAX){ dpr = Math.min(DPR_MAX, dpr + 0.125); renderer.setPixelRatio(dpr); fastT = 0; }
+}
 function tick(now){
-  const dt = Math.min(0.05, (now - lastT)/1000); lastT = now; time += dt;
+  requestAnimationFrame(tick);
+  if (now < nextFrame - 1.5) return;
+  nextFrame = now - nextFrame > FRAME_MS ? now + FRAME_MS : nextFrame + FRAME_MS;
+  const ms = now - lastT;
+  adaptResolution(ms);
+  const dt = Math.min(0.05, ms/1000); lastT = now; time += dt;
   U.uTime.value = time;
 
   const jf = nextJunction();
@@ -1980,15 +2022,16 @@ function tick(now){
 
   // dashboard
   const kmh = Math.abs(v)*3.6;
-  needle.setAttribute('transform', `rotate(${-210 + Math.min(50, kmh)/50*240 + 90} 100 100)`);
+  needle.setAttribute('transform', `rotate(${-210 + Math.min(DIAL_MAX, kmh)/DIAL_MAX*240 + 90} 100 100)`);
   el.speed.textContent = Math.round(kmh);
   if (el.driveState.textContent !== driveState) el.driveState.textContent = driveState;
   hudT -= dt; if (hudT <= 0){ hud(); hudT = 0.15; }
   renderer.render(scene, camera);
-  requestAnimationFrame(tick);
 }
 seasonState();
 applyLighting();
 hud();
+// compile every shader up front (hidden weather, sky and tram parts included) so none stalls a frame later
+renderer.compile(scene, camera);
 setTimeout(() => notice('Linha 31', matchMedia('(pointer: coarse)').matches ? 'Hold Go to drive. Tap Controls for help.' : 'Hold W or \u2191 to drive. Hover the i for all controls.', 6), 600);
 requestAnimationFrame(tick);
